@@ -1,0 +1,395 @@
+name: Cloud package test
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Platforms to test
+        type: choice
+        default: all
+        options: [all, windows, linux, macos, appimage, nixos, ubuntu26, ubuntu24, debs]
+      source_run:
+        description: Existing AppImage run for nixos, or compiled DEB run for diagnostic replay
+        type: string
+        default: ''
+      reuse_run:
+        description: Repackage matching compiled DEBs from a previous run; compile missing distros
+        type: string
+        default: ''
+  push:
+    branches: [codex/cloud-build-test]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: cloud-package-test-${{ github.ref }}-${{ inputs.platform || 'all' }}
+  cancel-in-progress: true
+
+jobs:
+  appimage:
+    needs: preflight
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'linux' || inputs.platform == 'appimage'
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Release AppImage with complete Qt and mpv runtime
+        shell: bash
+        run: bash scripts/release/appimage-build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-linux-appimage-x86_64
+          path: dist/appimage/*.AppImage
+          if-no-files-found: error
+          retention-days: 7
+
+  test_appimage:
+    needs: appimage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ubuntu:22.04
+            codename: jammy
+          - image: ubuntu:24.04
+            codename: noble
+          - image: debian:12
+            codename: bookworm
+          - image: debian:13
+            codename: trixie
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-linux-appimage-x86_64
+          path: build/appimage
+      - name: Install test displays and host graphics drivers
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates python3 binutils xvfb xauth xdotool weston libgl1-mesa-dri fonts-dejavu-core
+      - name: Launch AppImage on X11 and native Wayland
+        shell: bash
+        run: python3 scripts/release/check_appimage.py --image build/appimage/*.AppImage --distro '${{ matrix.codename }}' --report build/appimage-reports/${{ matrix.codename }}.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimage-report-${{ matrix.codename }}
+          path: build/appimage-reports/*.json
+          if-no-files-found: error
+          retention-days: 7
+
+  package_appimage:
+    needs: [test_appimage, test_appimage_nixos]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-linux-appimage-x86_64
+          path: build/appimage
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: appimage-report-*
+          path: build/appimage-reports
+      - name: Verify compatibility reports and package checksums
+        run: python3 scripts/release/finalize_appimage.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-linux-appimage-x86_64
+          path: dist/cloud/*
+          if-no-files-found: error
+          retention-days: 7
+
+  test_appimage_nixos:
+    needs: [preflight, appimage]
+    if: always() && needs.preflight.result == 'success' && (needs.appimage.result == 'success' || (inputs.platform == 'nixos' && inputs.source_run != ''))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-linux-appimage-x86_64
+          path: build/appimage
+          run-id: ${{ inputs.source_run || github.run_id }}
+          github-token: ${{ github.token }}
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            system-features = nixos-test benchmark big-parallel kvm
+      - name: Run X11 and native Wayland tests in NixOS 26.05 VM
+        shell: bash
+        run: |
+          test -c /dev/kvm
+          sudo setfacl -m "u:$(whoami):rw" /dev/kvm
+          images=("$GITHUB_WORKSPACE"/build/appimage/*.AppImage)
+          test "${#images[@]}" = 1
+          nix-build scripts/release/appimage-nixos.nix --arg image "${images[0]}" --out-link build/nixos-result --option sandbox false
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimage-report-nixos
+          path: build/nixos-result/nixos.json
+          if-no-files-found: error
+          retention-days: 7
+
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate source/export guards and artifact contracts
+        run: python3 scripts/release/check_release_safety.py
+      - name: Validate AppImage dependency policy and compatibility reports
+        run: python3 scripts/release/check_appimage_helpers.py
+      - name: Validate Linux packaging path guards
+        run: python3 scripts/release/check_linux_helpers.py
+
+  windows:
+    needs: preflight
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'windows'
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify source snapshot
+        run: python scripts/release/verify_source.py
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.9.2'
+          arch: win64_msvc2022_64
+          modules: qtwebsockets qtimageformats
+          cache: true
+      - name: Install pinned libmpv SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261021/mpv-dev-x86_64-20261021-git-e471496c56.7z'
+          Invoke-WebRequest $url -OutFile "$env:RUNNER_TEMP\mpv.7z"
+          $hash = (Get-FileHash "$env:RUNNER_TEMP\mpv.7z" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne 'efc719eff3dc5954b4a5efc800632808bcec01cc9034940dd14e5eb7fe9ea633') { throw 'libmpv SHA256 mismatch' }
+          7z x "$env:RUNNER_TEMP\mpv.7z" "-o$env:RUNNER_TEMP\mpv" -y
+          if ($LASTEXITCODE -ne 0) { throw 'libmpv extraction failed' }
+          New-Item -ItemType Directory -Force libs/libmpv/bin,libs/libmpv/lib,libs/libmpv/include/mpv | Out-Null
+          Copy-Item "$env:RUNNER_TEMP\mpv\libmpv-2.dll" libs/libmpv/bin/
+          Copy-Item "$env:RUNNER_TEMP\mpv\libmpv.dll.a" libs/libmpv/lib/
+          Copy-Item "$env:RUNNER_TEMP\mpv\include\mpv\*.h" libs/libmpv/include/mpv/
+      - name: Configure Release
+        run: cmake -S . -B build/cloud -G Ninja -DCMAKE_BUILD_TYPE=Release "-DQEMBY_QT_ROOT=${{ env.QT_ROOT_DIR }}"
+      - name: Build Release
+        run: cmake --build build/cloud --parallel 4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-windows-x64
+          path: build/cloud/bin/
+          if-no-files-found: error
+          retention-days: 7
+
+  package_windows:
+    needs: windows
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.9.2'
+          arch: win64_msvc2022_64
+          modules: qtwebsockets qtimageformats
+          cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-windows-x64
+          path: build/cloud/bin
+      - name: Install pinned Vulkan loader
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://sdk.lunarg.com/sdk/download/1.4.313.0/windows/VulkanRT-X64-1.4.313.0-Components.zip?Human=true'
+          $archive = Join-Path $env:RUNNER_TEMP 'vulkan-runtime.zip'
+          Invoke-WebRequest $url -Headers @{ 'Referer' = 'https://vulkan.lunarg.com/' } -OutFile $archive
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne 'e8d37913185142270a2bc1b3e1f8f498a4edf47405fddda666f2f38b30ca944b') { throw 'Vulkan runtime SHA256 mismatch' }
+          Expand-Archive $archive -DestinationPath "$env:RUNNER_TEMP\vulkan-runtime"
+          $components = Join-Path $env:RUNNER_TEMP 'vulkan-runtime\VulkanRT-X64-1.4.313.0-Components'
+          Copy-Item "$components\x64\vulkan-1.dll" build/cloud/bin/
+          Copy-Item "$components\VulkanRT-License.txt" build/cloud/bin/
+      - name: Package ZIP and installer
+        run: python scripts/release/package.py --platform windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-windows-x64
+          path: |
+            dist/cloud/*.zip
+            dist/cloud/*.exe
+            dist/cloud/*.txt
+            dist/cloud/*.json
+          if-no-files-found: error
+          retention-days: 7
+
+  linux:
+    needs: preflight
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'linux' || inputs.platform == 'debs' || inputs.platform == 'ubuntu26' || inputs.platform == 'ubuntu24'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJSON(inputs.platform == 'ubuntu24' && '[{"image":"ubuntu:24.04","codename":"noble"}]' || inputs.platform == 'ubuntu26' && '[{"image":"ubuntu:26.04","codename":"resolute"}]' || '[{"image":"ubuntu:22.04","codename":"jammy"},{"image":"ubuntu:24.04","codename":"noble"},{"image":"ubuntu:26.04","codename":"resolute"},{"image":"debian:12","codename":"bookworm"},{"image":"debian:13","codename":"trixie"}]') }}
+    container:
+      image: ${{ matrix.image }}
+    env:
+      QEMBY_DEB_DIST_TAG: ${{ matrix.codename }}
+      QEMBY_BUILD_KEEP_GOING: 'ON'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build and playback test dependencies
+        shell: bash
+        run: bash scripts/release/linux-build.sh --prepare
+      - uses: actions/download-artifact@v4
+        if: inputs.reuse_run != ''
+        continue-on-error: true
+        with:
+          name: debug-linux-${{ matrix.codename }}
+          run-id: ${{ inputs.reuse_run }}
+          github-token: ${{ github.token }}
+          path: build/reuse
+      - name: Verify whether compiled application inputs are unchanged
+        id: reuse
+        if: inputs.reuse_run != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release/reuse_deb.py --check --source-run '${{ inputs.reuse_run }}'
+      - uses: jurplel/install-qt-action@v4
+        if: inputs.source_run == ''
+        with:
+          version: '6.9.3'
+          arch: linux_gcc_64
+          modules: qtwebsockets qtimageformats
+          cache: true
+          install-deps: false
+          setup-python: false
+      - name: Build private Qt DEB and verify real video playback
+        if: inputs.source_run == '' && steps.reuse.outputs.reusable != 'true'
+        shell: bash
+        run: bash scripts/release/linux-build.sh
+      - name: Repackage matching binaries and rerun all playback/safety checks
+        if: inputs.source_run == '' && steps.reuse.outputs.reusable == 'true'
+        shell: bash
+        run: bash scripts/release/linux-build.sh --reuse
+      - uses: actions/download-artifact@v4
+        if: inputs.source_run != ''
+        with:
+          name: debug-linux-${{ matrix.codename }}
+          run-id: ${{ inputs.source_run }}
+          github-token: ${{ github.token }}
+          path: .
+      - name: Diagnose previously compiled playback binary without publishing
+        if: inputs.source_run != ''
+        shell: bash
+        run: |
+          chmod +x build/cloud/bin/qEmbyPlaybackProbe
+          python3 scripts/release/check_deb_playback.py --build-dir build/cloud
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: debug-linux-${{ matrix.codename }}
+          path: |
+            build/cloud/bin/
+            build/cloud/deb-safety-report.json
+            dist/cloud/*.deb
+            release-source.json
+          if-no-files-found: warn
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: inputs.source_run == ''
+        with:
+          name: package-linux-${{ matrix.codename }}-amd64
+          path: |
+            dist/cloud/*.deb
+            dist/cloud/*.txt
+            dist/cloud/*.json
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    needs: preflight
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'macos'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          test "$(uname -m)" = arm64
+          python3 scripts/release/verify_source.py
+          brew install mpv ninja pkg-config
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.9.2'
+          arch: clang_64
+          modules: qtwebsockets qtimageformats
+          cache: true
+      - name: Configure Release arm64
+        run: >-
+          cmake -S . -B build/cloud -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0
+          "-DQEMBY_QT_ROOT=$QT_ROOT_DIR"
+      - name: Build Release
+        run: cmake --build build/cloud --parallel 2
+      - name: Archive compiled application
+        run: tar -czf "$RUNNER_TEMP/macos-build.tar.gz" -C build/cloud bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-macos26-arm64
+          path: ${{ runner.temp }}/macos-build.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  package_macos:
+    needs: macos
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install runtime dependencies
+        run: brew install mpv
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.9.2'
+          arch: clang_64
+          modules: qtwebsockets qtimageformats
+          cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-macos26-arm64
+          path: ${{ runner.temp }}/compiled
+      - name: Restore compiled application
+        run: |
+          mkdir -p build/cloud
+          tar -xzf "$RUNNER_TEMP/compiled/macos-build.tar.gz" -C build/cloud
+      - name: Package and verify ad-hoc signed DMG
+        run: python3 scripts/release/package.py --platform macos
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-macos26-arm64
+          path: |
+            dist/cloud/*.dmg
+            dist/cloud/*.txt
+            dist/cloud/*.json
+          if-no-files-found: error
+          retention-days: 7
