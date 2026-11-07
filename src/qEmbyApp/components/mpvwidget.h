@@ -4,6 +4,7 @@
 #include <QString>
 #include <QVariantMap>
 #include <QMap>
+#include <QHash>
 #include <QUrl>
 #include <utility>
 #include <QPointer>
@@ -26,6 +27,7 @@
 class QRhiCommandBuffer;
 struct ID3D11Device;
 struct ID3D11DeviceContext;
+struct ID3D11Buffer;
 struct ID3D11Texture2D;
 struct ID3D11RenderTargetView;
 struct ID3D11ShaderResourceView;
@@ -121,12 +123,22 @@ private:
     void refreshVideoOutputState();
     void recordVideoFrameRendered(bool framePresent);
 #if defined(QEMBY_MPV_D3D11_RENDER)
-    // D3D11 渲染管线 (Qt RHI 桥 + 视频纹理复用 + 覆盖层混合)。
+    // D3D11 渲染管线 (Qt RHI 桥 + 视频纹理复用 + 弹幕精灵四边形合成)。
     bool ensureD3D11Resources(const QSize &targetSize);
     void releaseD3D11Resources();
-    bool rasterizeDanmaku(const QSize &targetSize, qreal danmakuPosition);
-    void drawOverlayQuad(ID3D11ShaderResourceView *srv, bool alphaBlend,
-                         const QSize &targetSize);
+    // 弹幕精灵纹理缓存: id -> GPU 纹理, 仅在精灵首次使用时上传一次 (零每 tick 上传)。
+    struct DanmakuSpriteTex {
+        ID3D11Texture2D *tex = nullptr;
+        ID3D11ShaderResourceView *srv = nullptr;
+        QSize size;
+        qint64 lastUsedTick = 0;
+    };
+    ID3D11ShaderResourceView *ensureSpriteTexture(int spriteId);
+    void releaseDanmakuSpriteTexes();
+    void evictIdleSpriteTextures();
+    void drawQuad(ID3D11ShaderResourceView *srv, const QRect &dstRectDevicePx,
+                  const QRect &clipRectDevicePx, bool alphaBlend, float opacity,
+                  const QSize &targetSize);
     void updateUiRefreshTimer();
     int uiRefreshIntervalMs() const;
     // UI 节拍条件 (媒体在播或弹幕活动), 定时器兜底与 vsync 自持链共用。
@@ -187,8 +199,6 @@ private:
     QTimer m_uiRefreshTimer;                           // 独立 UI 节拍 (屏幕刷新率)
     QElapsedTimer m_paceVsyncClock;                    // 上次 vsync 驱动重拍的时刻 (陈旧判定)
     bool m_playbackPaused = true;
-    qreal m_lastDanmakuRasterPos = -1.0;               // 上次弹幕光栅的时钟位置
-    QSize m_lastDanmakuRasterSize;                     // 上次弹幕光栅的表面尺寸
     // 渲染回路性能剖析 (每 2s 汇总一次, 用于定位顿挫瓶颈)。
     QElapsedTimer m_perfClock;
     qint64 m_perfPaints = 0;
@@ -207,16 +217,17 @@ private:
     qint64 m_perfDeferTicks = 0;                       // 窗口内预算让行次数
     ID3D11Texture2D *m_d3dColorTex = nullptr;          // AddRef
     ID3D11RenderTargetView *m_d3dColorRtv = nullptr;   // owned
-    ID3D11Texture2D *m_danmakuTex = nullptr;           // owned
-    ID3D11ShaderResourceView *m_danmakuSrv = nullptr;  // owned
+    QHash<int, DanmakuSpriteTex> m_danmakuSpriteTexes; // owned: 弹幕精灵纹理缓存
+    quint64 m_danmakuSpriteEpoch = ~quint64(0);        // 与 overlay 代号比对, 不一致整表释放
+    qint64 m_spriteUseTick = 0;                        // 单调递增, 用于闲置剔除
+    float m_quadParamOpacity = -1.0f;                  // 常量缓冲当前值 (避免逐 sprite 重复写)
     ID3D11VertexShader *m_quadVs = nullptr;            // owned
     ID3D11PixelShader *m_quadPs = nullptr;             // owned
     ID3D11BlendState *m_blendState = nullptr;          // owned
     ID3D11SamplerState *m_sampler = nullptr;           // owned
     ID3D11RasterizerState *m_rasterState = nullptr;    // owned
     ID3D11DepthStencilState *m_depthState = nullptr;   // owned
-    QImage m_danmakuBuffer;
-    QSize m_danmakuTexSize;
+    ID3D11Buffer *m_quadParamCb = nullptr;             // owned: 不透明度常量缓冲
 #endif
 
 

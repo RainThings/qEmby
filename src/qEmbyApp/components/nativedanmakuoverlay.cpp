@@ -59,6 +59,7 @@ NativeDanmakuOverlay::NativeDanmakuOverlay(MpvWidget *widget, QObject *parent)
         m_schedule = m_layoutWatcher.result();
         if (!m_layoutIsReflow) {
             m_spriteCache.clear();
+            ++m_spriteCacheEpoch;
             m_failedSprites.clear();
             m_spriteDpr = devicePixelRatioF();
         }
@@ -210,6 +211,7 @@ void NativeDanmakuOverlay::setComments(QList<DanmakuComment> comments)
     m_schedule = {};
     m_activeIndexes.clear();
     m_spriteCache.clear();
+    ++m_spriteCacheEpoch;
     requestScheduleRebuild();
     updatePresentation();
 }
@@ -225,6 +227,7 @@ void NativeDanmakuOverlay::clearDanmaku(bool resetMotionReference)
     m_schedule = {};
     m_activeIndexes.clear();
     m_spriteCache.clear();
+    ++m_spriteCacheEpoch;
     m_failedSprites.clear();
     m_scheduleDirty = false;
     m_lastPositionMs = -1.0;
@@ -262,6 +265,7 @@ void NativeDanmakuOverlay::invalidateGraphicsCache()
     
     
     m_spriteCache.clear();
+    ++m_spriteCacheEpoch;
     m_graphicsAvailable = true;
     m_lastPaint.invalidate();
     resetFrameTiming();
@@ -317,7 +321,14 @@ void NativeDanmakuOverlay::paint(QPainter &painter, qreal position)
     }
     painter.restore();
     if (shouldAnimate()) {
-        if (m_lastFramePositionMs >= 0.0) {
+        advanceFrameStats(position);
+    }
+}
+
+// 帧节拍统计块 (paint 与 collectActiveSprites 共用,记账行为不变)。
+void NativeDanmakuOverlay::advanceFrameStats(qreal position)
+{
+    if (m_lastFramePositionMs >= 0.0) {
             
             
             const qreal step = (position - m_lastFramePositionMs) / m_clock.speed();
@@ -360,7 +371,64 @@ void NativeDanmakuOverlay::paint(QPainter &painter, qreal position)
             m_minFrameStepMs = -1.0;
             m_maxFrameStepMs = m_maxPhaseErrorMs = 0.0;
         }
+}
+
+// D3D11 精灵四边形合成采集: 每 tick 只推进记账并产出 (sprite, x, y) 位置,
+// 不做整屏光栅。记账语义与 paint 一致 (updateActiveItems / 缺失精灵计数 /
+// advanceFrameStats 帧统计块), GL 回退路径继续走 paint。
+bool NativeDanmakuOverlay::collectActiveSprites(qreal positionMs, QVector<SpritePlacement> *out)
+{
+    if (out) {
+        out->clear();
     }
+    if (!m_videoPresented || !m_visibleRequested || !m_options.enabled || m_schedule.items.isEmpty()) {
+        return false;
+    }
+    if (!qFuzzyCompare(m_spriteDpr, devicePixelRatioF())) {
+        m_spriteDpr = devicePixelRatioF();
+        requestScheduleRebuild();
+        return false;
+    }
+    updateActiveItems(positionMs);
+    for (int index : std::as_const(m_activeIndexes)) {
+        const auto &item = m_schedule.items.at(index);
+        // 与 paint 绘制循环同语义: 精灵未就绪计缺失并跳过 (含 LRU 访问记账)。
+        if (!m_spriteCache.object(item.sprite)) {
+            ++m_spriteMisses;
+            continue;
+        }
+        const qreal progress = std::clamp((positionMs - item.startMs) /
+            (item.endMs - item.startMs), 0.0, 1.0);
+        const qreal x = item.xFrom + (item.xTo - item.xFrom) * progress;
+        if (out) {
+            out->append({item.sprite, x, item.y});
+        }
+    }
+    if (shouldAnimate()) {
+        advanceFrameStats(positionMs);
+    }
+    return true;
+}
+
+QImage NativeDanmakuOverlay::spriteImage(int spriteId) const
+{
+    const QPixmap *sprite = m_spriteCache.object(spriteId);
+    return sprite ? sprite->toImage() : QImage();
+}
+
+QRectF NativeDanmakuOverlay::clipSurface() const
+{
+    return m_schedule.surface.intersected(effectiveSurfaceRect());
+}
+
+qreal NativeDanmakuOverlay::contentOpacity() const
+{
+    return std::clamp(m_options.opacity, 0.0, 1.0);
+}
+
+quint64 NativeDanmakuOverlay::spriteCacheEpoch() const
+{
+    return m_spriteCacheEpoch;
 }
 
 bool NativeDanmakuOverlay::eventFilter(QObject *watched, QEvent *event)

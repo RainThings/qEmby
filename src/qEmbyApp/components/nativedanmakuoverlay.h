@@ -33,6 +33,19 @@ public:
     bool isActive() const;
     qreal beginFrame();
     void paint(QPainter &painter, qreal positionMs);
+    // D3D11 精灵四边形合成采集 API: 每 tick 只取活跃弹幕的位置与精灵图,
+    // 不做整屏 CPU 光栅 (GL 回退路径继续走 paint)。collectActiveSprites 的
+    // 记账语义与 paint 一致 (updateActiveItems / 帧统计块 / 缺失精灵计数)。
+    struct SpritePlacement {
+        int spriteId = -1;
+        qreal x = 0.0;
+        qreal y = 0.0;
+    };
+    bool collectActiveSprites(qreal positionMs, QVector<SpritePlacement> *out);
+    QImage spriteImage(int spriteId) const;      // 仅纹理上传时调用 (非每 tick)
+    QRectF clipSurface() const;                  // = m_schedule.surface ∩ effectiveSurfaceRect()
+    qreal contentOpacity() const;                // = clamp(m_options.opacity, 0, 1)
+    quint64 spriteCacheEpoch() const;            // 纹理失效代号 (clear 时递增)
     void invalidateGraphicsCache();
     void setGraphicsAvailable(bool available);
 
@@ -50,6 +63,7 @@ private:
     void invalidateWork();
     void updatePresentation();
     void updateActiveItems(qreal positionMs, bool rebuild = false);
+    void advanceFrameStats(qreal position);
     void prepareSprites();
     void syncPlaybackClock(bool anchor = false);
     void synchronizePosition(double seconds, bool discontinuity = false);
@@ -101,6 +115,7 @@ private:
     quint64 m_generation = 0;
     quint64 m_layoutGeneration = 0;
     quint64 m_spriteGeneration = 0;
+    quint64 m_spriteCacheEpoch = 0;
     qreal m_spriteDpr = 1.0;
     qreal m_lastPositionMs = -1.0;
     int m_nextIndex = 0;

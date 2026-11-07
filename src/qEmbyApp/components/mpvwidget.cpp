@@ -73,6 +73,7 @@ VSOut main(uint vid : SV_VertexID) {
 )";
 
 const char kQuadPixelShaderHlsl[] = R"(
+cbuffer QuadParams : register(b0) { float opacity; };
 Texture2D quadTex : register(t0);
 SamplerState quadSampler : register(s0);
 struct VSOut {
@@ -80,7 +81,8 @@ struct VSOut {
     float2 uv  : TEXCOORD0;
 };
 float4 main(VSOut i) : SV_Target {
-    return quadTex.Sample(quadSampler, i.uv);
+    // 预乘 alpha 纹理 × 标量 = 正确的全局透明度 (opacity=1.0 时输出=原样采样)。
+    return quadTex.Sample(quadSampler, i.uv) * opacity;
 }
 )";
 
@@ -493,8 +495,9 @@ void MpvWidget::onRenderContextReady() {
 // mpv 以 MPV_RENDER_API_TYPE_D3D11 创建渲染上下文, 直接把视频帧渲染进 Qt
 // RHI 的颜色纹理 (QRhiWidget::colorTexture); d3d11va 硬解 Surface 在同一
 // ID3D11Device 上流转, 全程无 GPU->CPU->GPU 回传 (原生零拷贝)。弹幕由
-// NativeDanmakuOverlay 以 QPainter 光栅进 QImage 后作为纹理按预乘 alpha
-// 混合叠加。整个渲染在 QRhiCommandBuffer 的 beginExternal 块内以原生 D3D11
+// NativeDanmakuOverlay 采集精灵位置, 按精灵纹理缓存逐个画小四边形按预乘
+// alpha 混合叠加 (纹理仅装入时上传一次, 无每 tick 光栅与整屏上传)。
+// 整个渲染在 QRhiCommandBuffer 的 beginExternal 块内以原生 D3D11
 // 完成, 与 QRhi 状态跟踪契约兼容。
 
 ID3D11Device *MpvWidget::d3dDevice() const {
@@ -634,6 +637,9 @@ bool MpvWidget::ensureD3D11Resources(const QSize &targetSize) {
         rasterizer.FillMode = D3D11_FILL_SOLID;
         rasterizer.CullMode = D3D11_CULL_NONE;
         rasterizer.DepthClipEnable = TRUE;
+        // scissor 由 drawQuad 对每次绘制显式设置 (视频全幅 / 精灵各自矩形),
+        // 避免 ScissorEnable 打开后状态悬空。
+        rasterizer.ScissorEnable = TRUE;
         device->CreateRasterizerState(&rasterizer, &m_rasterState);
 
         D3D11_DEPTH_STENCIL_DESC depth{};
@@ -645,6 +651,20 @@ bool MpvWidget::ensureD3D11Resources(const QSize &targetSize) {
             qWarning() << "[MpvWidget] Danmaku pipeline state creation failed";
             return false;
         }
+    }
+
+    if (!m_quadParamCb) {
+        // 不透明度常量缓冲 (sizeof(float) 对齐到 16 字节)。创建失败则整条覆盖层
+        // 管线不可用 (PS opacity 读 0 会黑屏), 走 pipelineReady=false 视频直渲回退。
+        D3D11_BUFFER_DESC cbd{};
+        cbd.ByteWidth = static_cast<UINT>((sizeof(float) + 15u) & ~15u);
+        cbd.Usage = D3D11_USAGE_DEFAULT;
+        cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        if (FAILED(device->CreateBuffer(&cbd, nullptr, &m_quadParamCb))) {
+            qWarning() << "[MpvWidget] Quad params constant buffer creation failed";
+            return false;
+        }
+        m_quadParamOpacity = -1.0f;
     }
 
     // Qt RHI 颜色纹理 (可能随尺寸/重建而更换), 弹幕混合需要它的 RTV。
@@ -667,14 +687,6 @@ bool MpvWidget::ensureD3D11Resources(const QSize &targetSize) {
             qWarning() << "[MpvWidget] Danmaku overlay RTV creation failed";
             return false;
         }
-    }
-
-    if (m_danmakuTex && m_danmakuTexSize != targetSize) {
-        m_danmakuSrv->Release();
-        m_danmakuSrv = nullptr;
-        m_danmakuTex->Release();
-        m_danmakuTex = nullptr;
-        m_danmakuTexSize = QSize();
     }
 
     // 视频帧缓存纹理: mpv 只在有新帧时渲染进它, 无新帧时复用其中已呈现的画面。
@@ -715,10 +727,9 @@ void MpvWidget::releaseD3D11Resources() {
     if (m_videoTex) { m_videoTex->Release(); m_videoTex = nullptr; }
     m_videoTexSize = QSize();
     m_videoTextureDirty = true;
-    if (m_danmakuSrv) { m_danmakuSrv->Release(); m_danmakuSrv = nullptr; }
-    if (m_danmakuTex) { m_danmakuTex->Release(); m_danmakuTex = nullptr; }
-    m_lastDanmakuRasterPos = -1.0;
-    m_lastDanmakuRasterSize = QSize();
+    releaseDanmakuSpriteTexes();
+    m_danmakuSpriteEpoch = ~quint64(0);
+    m_spriteUseTick = 0;
     if (m_d3dColorRtv) { m_d3dColorRtv->Release(); m_d3dColorRtv = nullptr; }
     if (m_d3dColorTex) { m_d3dColorTex->Release(); m_d3dColorTex = nullptr; }
     if (m_quadVs) { m_quadVs->Release(); m_quadVs = nullptr; }
@@ -727,8 +738,8 @@ void MpvWidget::releaseD3D11Resources() {
     if (m_sampler) { m_sampler->Release(); m_sampler = nullptr; }
     if (m_rasterState) { m_rasterState->Release(); m_rasterState = nullptr; }
     if (m_depthState) { m_depthState->Release(); m_depthState = nullptr; }
-    m_danmakuBuffer = QImage();
-    m_danmakuTexSize = QSize();
+    if (m_quadParamCb) { m_quadParamCb->Release(); m_quadParamCb = nullptr; }
+    m_quadParamOpacity = -1.0f;
 }
 
 void MpvWidget::releaseResources() {
@@ -747,69 +758,111 @@ void MpvWidget::releaseResources() {
     }
 }
 
-bool MpvWidget::rasterizeDanmaku(const QSize &targetSize, qreal danmakuPosition) {
+ID3D11ShaderResourceView *MpvWidget::ensureSpriteTexture(int spriteId) {
     ID3D11Device *device = d3dDevice();
     ID3D11DeviceContext *context = d3dContext();
     if (!device || !context || !m_nativeDanmakuOverlay) {
-        return false;
+        return nullptr;
     }
-
-    // 弹幕时钟位置未变 (暂停/定格) 时跳过 CPU 光栅与纹理上传, 复用上一帧覆盖层。
-    if (m_danmakuTex && m_danmakuTexSize == targetSize &&
-        m_lastDanmakuRasterSize == targetSize &&
-        m_lastDanmakuRasterPos == danmakuPosition) {
-        return true;
+    auto it = m_danmakuSpriteTexes.find(spriteId);
+    if (it != m_danmakuSpriteTexes.end()) {
+        it->lastUsedTick = m_spriteUseTick;
+        return it->srv;
     }
-
-    if (!m_danmakuTex) {
-        D3D11_TEXTURE2D_DESC desc{};
-        desc.Width = static_cast<UINT>(targetSize.width());
-        desc.Height = static_cast<UINT>(targetSize.height());
-        desc.MipLevels = 1;
-        desc.ArraySize = 1;
-        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        desc.SampleDesc.Count = 1;
-        desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(device->CreateTexture2D(&desc, nullptr, &m_danmakuTex)) ||
-            FAILED(device->CreateShaderResourceView(m_danmakuTex, nullptr, &m_danmakuSrv))) {
-            if (m_danmakuTex) { m_danmakuTex->Release(); m_danmakuTex = nullptr; }
-            qWarning() << "[MpvWidget] Danmaku texture creation failed | size:" << targetSize;
-            return false;
+    QImage image = m_nativeDanmakuOverlay->spriteImage(spriteId);
+    if (image.isNull()) {
+        return nullptr;
+    }
+    // 统一转 RGBA8888 预乘 (源可能是 BGRA 布局的 ARGB32_Premultiplied)。
+    if (image.format() != QImage::Format_RGBA8888_Premultiplied) {
+        image = image.convertToFormat(QImage::Format_RGBA8888_Premultiplied);
+    }
+    if (image.isNull()) {
+        return nullptr;
+    }
+    DanmakuSpriteTex entry;
+    entry.size = image.size();
+    entry.lastUsedTick = m_spriteUseTick;
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = static_cast<UINT>(image.width());
+    desc.Height = static_cast<UINT>(image.height());
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    HRESULT hr = device->CreateTexture2D(&desc, nullptr, &entry.tex);
+    if (SUCCEEDED(hr)) {
+        hr = device->CreateShaderResourceView(entry.tex, nullptr, &entry.srv);
+    }
+    if (SUCCEEDED(hr)) {
+        // 仅装入时上传一次 (DEFAULT 纹理此时尚未被 GPU 采样, 无每 tick 同步点)。
+        context->UpdateSubresource(entry.tex, 0, nullptr, image.constBits(),
+                                   static_cast<UINT>(image.bytesPerLine()), 0);
+    }
+    if (FAILED(hr)) {
+        if (entry.srv) { entry.srv->Release(); entry.srv = nullptr; }
+        if (entry.tex) { entry.tex->Release(); entry.tex = nullptr; }
+        // 上传失败跳过该 sprite, 限次告警。
+        static int spriteUploadWarnings = 0;
+        if (spriteUploadWarnings < 16) {
+            ++spriteUploadWarnings;
+            qWarning() << "[MpvWidget] Danmaku sprite texture upload failed"
+                       << "| id:" << spriteId << "| hr:" << Qt::hex << hr;
         }
-        m_danmakuTexSize = targetSize;
+        return nullptr;
     }
-
-    if (m_danmakuBuffer.size() != targetSize) {
-        m_danmakuBuffer = QImage(targetSize, QImage::Format_RGBA8888_Premultiplied);
-    }
-    m_danmakuBuffer.fill(Qt::transparent);
-    const qreal dpr = devicePixelRatioF();
-    QPainter painter(&m_danmakuBuffer);
-    // NativeDanmakuOverlay 以逻辑坐标绘制 (与 QOpenGLWidget 的设备变换一致)。
-    painter.scale(dpr, dpr);
-    m_nativeDanmakuOverlay->paint(painter, danmakuPosition);
-    painter.end();
-
-    context->UpdateSubresource(m_danmakuTex, 0, nullptr,
-                               m_danmakuBuffer.constBits(),
-                               static_cast<UINT>(m_danmakuBuffer.bytesPerLine()), 0);
-    m_lastDanmakuRasterPos = danmakuPosition;
-    m_lastDanmakuRasterSize = targetSize;
-    return true;
+    m_danmakuSpriteTexes.insert(spriteId, entry);
+    return entry.srv;
 }
 
-void MpvWidget::drawOverlayQuad(ID3D11ShaderResourceView *srv, bool alphaBlend,
-                               const QSize &targetSize) {
+void MpvWidget::releaseDanmakuSpriteTexes() {
+    for (auto it = m_danmakuSpriteTexes.begin(); it != m_danmakuSpriteTexes.end(); ++it) {
+        if (it->srv) { it->srv->Release(); it->srv = nullptr; }
+        if (it->tex) { it->tex->Release(); it->tex = nullptr; }
+    }
+    m_danmakuSpriteTexes.clear();
+}
+
+void MpvWidget::evictIdleSpriteTextures() {
+    // 闲置剔除: 帧数换算闲置时长 (>300 帧 ≈ 5s@60fps), 无需真实计时。
+    constexpr qint64 kIdleEvictTicks = 300;
+    for (auto it = m_danmakuSpriteTexes.begin(); it != m_danmakuSpriteTexes.end();) {
+        if (m_spriteUseTick - it->lastUsedTick > kIdleEvictTicks) {
+            if (it->srv) { it->srv->Release(); }
+            if (it->tex) { it->tex->Release(); }
+            it = m_danmakuSpriteTexes.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void MpvWidget::drawQuad(ID3D11ShaderResourceView *srv, const QRect &dstRectDevicePx,
+                         const QRect &clipRectDevicePx, bool alphaBlend, float opacity,
+                         const QSize &targetSize) {
     ID3D11DeviceContext *context = d3dContext();
-    if (!context || !m_d3dColorRtv || !srv) {
+    if (!context || !m_d3dColorRtv || !srv || !m_quadParamCb) {
         return;
     }
-    D3D11_VIEWPORT viewport{};
-    viewport.Width = static_cast<FLOAT>(targetSize.width());
-    viewport.Height = static_cast<FLOAT>(targetSize.height());
-    viewport.MaxDepth = 1.0f;
-    context->RSSetViewports(1, &viewport);
+    // 矩形绘制技巧: viewport=目标矩形 + 全屏三角形 (SV_VertexID VS 不变),
+    // scissor=裁剪矩形∩viewport, 非空才绘制。
+    const QRect viewport = dstRectDevicePx.intersected(QRect(QPoint(0, 0), targetSize));
+    const QRect scissor = clipRectDevicePx.intersected(viewport);
+    if (viewport.isEmpty() || scissor.isEmpty()) {
+        return;
+    }
+    D3D11_VIEWPORT vp{};
+    vp.TopLeftX = static_cast<FLOAT>(viewport.x());
+    vp.TopLeftY = static_cast<FLOAT>(viewport.y());
+    vp.Width = static_cast<FLOAT>(viewport.width());
+    vp.Height = static_cast<FLOAT>(viewport.height());
+    vp.MaxDepth = 1.0f;
+    context->RSSetViewports(1, &vp);
+    const D3D11_RECT scissorRect{scissor.x(), scissor.y(),
+                                 scissor.x() + scissor.width(), scissor.y() + scissor.height()};
+    context->RSSetScissorRects(1, &scissorRect);
     context->RSSetState(m_rasterState);
     context->IASetInputLayout(nullptr);
     context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -817,6 +870,11 @@ void MpvWidget::drawOverlayQuad(ID3D11ShaderResourceView *srv, bool alphaBlend,
     context->PSSetShader(m_quadPs, nullptr, 0);
     context->PSSetShaderResources(0, 1, &srv);
     context->PSSetSamplers(0, 1, &m_sampler);
+    if (m_quadParamOpacity != opacity) {
+        m_quadParamOpacity = opacity;
+        context->UpdateSubresource(m_quadParamCb, 0, nullptr, &opacity, 0, 0);
+    }
+    context->PSSetConstantBuffers(0, 1, &m_quadParamCb);
     context->OMSetBlendState(alphaBlend ? m_blendState : nullptr, nullptr, 0xffffffffu);
     context->OMSetDepthStencilState(m_depthState, 0);
     context->OMSetRenderTargets(1, &m_d3dColorRtv, nullptr);
@@ -917,19 +975,42 @@ void MpvWidget::render(QRhiCommandBuffer *cb) {
 
     bool danmakuActive = pipelineReady && m_nativeDanmakuOverlay &&
                          m_nativeDanmakuOverlay->isActive() && !m_nativeCompositeFailed;
+    // 弹幕精灵四边形合成: 每 tick 只采集位置并画 N 个小四边形, 精灵纹理仅在
+    // 首次装入时上传一次 (m_danmakuSpriteTexes 缓存), 零每 tick 光栅/整屏上传。
+    QVector<NativeDanmakuOverlay::SpritePlacement> danmakuPlacements;
+    qreal danmakuOpacity = 1.0;
+    QRect danmakuClipDevicePx;
     if (danmakuActive) {
         QElapsedTimer perfRaster;
         perfRaster.start();
         const qreal danmakuPosition = m_nativeDanmakuOverlay->beginFrame();
-        const bool rasterOk = rasterizeDanmaku(targetSize, danmakuPosition);
+        const bool collected =
+            m_nativeDanmakuOverlay->collectActiveSprites(danmakuPosition, &danmakuPlacements);
+        if (collected) {
+            danmakuOpacity = m_nativeDanmakuOverlay->contentOpacity();
+            // 与 paint 的 setClipRect(surface ∩ effectiveSurfaceRect) 对齐 (取整到设备像素)。
+            const qreal dpr = devicePixelRatioF();
+            const QRectF clip = m_nativeDanmakuOverlay->clipSurface();
+            danmakuClipDevicePx = QRect(qRound(clip.x() * dpr), qRound(clip.y() * dpr),
+                                        qRound(clip.width() * dpr), qRound(clip.height() * dpr));
+            // 精灵纹理缓存按 overlay 缓存代号失效 (id→内容跨代可能变化, 整表释放)。
+            const quint64 spriteEpoch = m_nativeDanmakuOverlay->spriteCacheEpoch();
+            if (spriteEpoch != m_danmakuSpriteEpoch) {
+                m_danmakuSpriteEpoch = spriteEpoch;
+                releaseDanmakuSpriteTexes();
+            }
+            ++m_spriteUseTick;
+            for (const NativeDanmakuOverlay::SpritePlacement &placement :
+                 std::as_const(danmakuPlacements)) {
+                ensureSpriteTexture(placement.spriteId);   // 命中缓存或仅上传一次
+            }
+        }
+        // rasterAvgMs/rasterMaxMs 字段名不变: 语义改为采集 + 精灵纹理上传耗时。
         const qint64 rasterNs = perfRaster.nsecsElapsed();
         m_perfRasterNs += rasterNs;
         m_perfRasterMaxNs = std::max(m_perfRasterMaxNs, rasterNs);
-        if (!rasterOk) {
-            qWarning() << "[Danmaku][Composite] Disabled after danmaku raster failure; preserving video";
-            m_nativeCompositeFailed = true;
-            m_nativeDanmakuOverlay->setGraphicsAvailable(false);
-            danmakuActive = false;
+        if (collected && m_spriteUseTick % 120 == 0) {
+            evictIdleSpriteTextures();                     // 每 ~120 帧剔除闲置条目
         }
     }
 
@@ -986,9 +1067,24 @@ void MpvWidget::render(QRhiCommandBuffer *cb) {
     }
 
     if (pipelineReady) {
-        drawOverlayQuad(m_videoSrv, false, targetSize);
+        const QRect targetRect(QPoint(0, 0), targetSize);
+        // 视频四边形: 全幅 + opacity 1.0 (PS 输出=原样采样) + 全幅 scissor。
+        drawQuad(m_videoSrv, targetRect, targetRect, false, 1.0f, targetSize);
         if (danmakuActive) {
-            drawOverlayQuad(m_danmakuSrv, true, targetSize);
+            // 逐精灵小四边形: dst=位置×dpr+纹理像素尺寸 (纹理按 dpr 光栅即设备尺寸),
+            // 先视频后弹幕, 预乘 alpha 混合 + 全局透明度, 裁剪同 paint 的 clipRect。
+            const qreal dpr = devicePixelRatioF();
+            for (const NativeDanmakuOverlay::SpritePlacement &placement :
+                 std::as_const(danmakuPlacements)) {
+                const auto it = m_danmakuSpriteTexes.constFind(placement.spriteId);
+                if (it == m_danmakuSpriteTexes.constEnd() || !it->srv) {
+                    continue;
+                }
+                const QRect dst(qRound(placement.x * dpr), qRound(placement.y * dpr),
+                                it->size.width(), it->size.height());
+                drawQuad(it->srv, dst, danmakuClipDevicePx, true,
+                         static_cast<float>(danmakuOpacity), targetSize);
+            }
         }
     }
 
