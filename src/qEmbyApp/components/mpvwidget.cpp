@@ -846,18 +846,21 @@ void MpvWidget::drawQuad(ID3D11ShaderResourceView *srv, const QRect &dstRectDevi
     if (!context || !m_d3dColorRtv || !srv || !m_quadParamCb) {
         return;
     }
-    // 矩形绘制技巧: viewport=目标矩形 + 全屏三角形 (SV_VertexID VS 不变),
-    // scissor=裁剪矩形∩viewport, 非空才绘制。
-    const QRect viewport = dstRectDevicePx.intersected(QRect(QPoint(0, 0), targetSize));
-    const QRect scissor = clipRectDevicePx.intersected(viewport);
-    if (viewport.isEmpty() || scissor.isEmpty()) {
+    // 矩形绘制技巧: viewport=完整目标矩形 + 全屏三角形 (SV_VertexID VS 不变)。
+    // viewport 绝不能与屏幕求交: UV 0..1 映射在 viewport 上, 截短 viewport 会把
+    // 整张纹理压缩进可见区域 (边缘弹幕文字弯折压缩)。裁剪只能用 scissor
+    // (逐像素裁剪不改变映射); viewport 允许负原点/部分离屏 (D3D11 规范支持,
+    // 出屏像素在输出合并阶段自然丢弃)。
+    const QRect scissor = clipRectDevicePx.intersected(dstRectDevicePx)
+                              .intersected(QRect(QPoint(0, 0), targetSize));
+    if (dstRectDevicePx.isEmpty() || scissor.isEmpty()) {
         return;
     }
     D3D11_VIEWPORT vp{};
-    vp.TopLeftX = static_cast<FLOAT>(viewport.x());
-    vp.TopLeftY = static_cast<FLOAT>(viewport.y());
-    vp.Width = static_cast<FLOAT>(viewport.width());
-    vp.Height = static_cast<FLOAT>(viewport.height());
+    vp.TopLeftX = static_cast<FLOAT>(dstRectDevicePx.x());
+    vp.TopLeftY = static_cast<FLOAT>(dstRectDevicePx.y());
+    vp.Width = static_cast<FLOAT>(dstRectDevicePx.width());
+    vp.Height = static_cast<FLOAT>(dstRectDevicePx.height());
     vp.MaxDepth = 1.0f;
     context->RSSetViewports(1, &vp);
     const D3D11_RECT scissorRect{scissor.x(), scissor.y(),
