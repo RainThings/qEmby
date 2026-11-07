@@ -24,6 +24,9 @@ NativeDanmakuOverlay::NativeDanmakuOverlay(MpvWidget *widget, QObject *parent)
         m_widget->installEventFilter(this);
         
         
+        // 呈现反馈分工因渲染通道而异: D3D11 (QEMBY_MPV_D3D11_RENDER) 下重绘由
+        // MpvWidget 的 vsync 自持节拍链驱动, 此处仅作 DanmakuFrameClock 相位校正;
+        // GL 回退路径无独立节拍链, requestNextFrame() 末尾的 update() 仍是帧泵驱动源。
         connect(m_widget, &MpvWidget::surfaceFrameSwapped, this,
                 &NativeDanmakuOverlay::requestNextFrame, Qt::DirectConnection);
     }
@@ -823,9 +826,13 @@ void NativeDanmakuOverlay::requestNextFrame()
     }
     m_swapClock.start();
     ++m_swapCount;
-    
-    
+#if !defined(QEMBY_MPV_D3D11_RENDER)
+    // GL 路径: 帧泵仍是重绘驱动源 (无独立节拍链)。
     update();
+#else
+    // D3D11: 重绘由 vsync 节拍链驱动 (MpvWidget 自持链), 呈现反馈仅作
+    // DanmakuFrameClock 相位校正参考, 不再驱动帧泵 —— 消除劣化回环。
+#endif
 }
 
 void NativeDanmakuOverlay::resetFrameTiming()
