@@ -140,7 +140,7 @@
     "src/qEmbyApp/components/mpvwidget.h": "0ef4357af69bceaaec5c686a1235842b03744cd6a14b27d356a9e9b425876fc0",
     "src/qEmbyApp/components/musictracklistwidget.cpp": "83983a359b26563dd62aa0579b582a9eb1f9488a426719ec00b563f35b090f31",
     "src/qEmbyApp/components/musictracklistwidget.h": "31173d9389db0bbf3f59c2930ebe10c0d023a7498e23b3c2780fa4e180da53ec",
-    "src/qEmbyApp/components/nativedanmakuoverlay.cpp": "f562ba3e9ab15af87bd060e175d7315c2174b605efdfb07acdee54caff6e5c88",
+    "src/qEmbyApp/components/nativedanmakuoverlay.cpp": "e0dc934dc826a97e5d2ba135b800659e0d940f6c120670671bc0a6eafc14a34d",
     "src/qEmbyApp/components/nativedanmakuoverlay.h": "c14faa00eb11a2bc08484620da2c5a14f54ac23abc3f7d9c82f2c5c31278e96c",
     "src/qEmbyApp/components/pageturnoverlaywidget.cpp": "90c1a47a3405b0ce1aeba6f9fdefac8befe1ad438ca79a8605e1d9bf83980a94",
     "src/qEmbyApp/components/pageturnoverlaywidget.h": "2d551e4aae3f01d93f28e0083e486009ccb656606cfa47bd5965652eaddbb1b8",
