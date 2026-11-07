@@ -427,6 +427,11 @@ void MpvWidget::resetVideoPresentation(bool resetMedia) {
         m_videoFramePending = true;
         m_videoAwaitingSwap = false;
         m_videoDueTimer.stop();
+#if defined(QEMBY_MPV_D3D11_RENDER)
+        m_videoRenderPending = false;
+        m_videoRenderDeferTicks = 0;
+        m_videoRenderCostEwmaMs = 0.0;
+#endif
     }
     if (m_videoPresented) {
         m_videoPresented = false;
@@ -878,10 +883,28 @@ void MpvWidget::render(QRhiCommandBuffer *cb) {
 
     // 按需纹理复用: 仅当有新视频帧或视频缓存纹理失效 (新建/换尺寸) 时执行
     // 完整 mpv 渲染, 否则复用缓存纹理中已呈现的画面 —— 重绘节拍与视频帧率
-    // 彻底解耦, 无新帧的 tick 只更新覆盖层。
+    // 彻底解耦, 无新帧的 tick 只更新覆盖层。渲染成本超预算的 tick 让行顺延。
     const bool newVideoFrame =
         (mpv_render_context_update(m_mpv_gl) & MPV_RENDER_UPDATE_FRAME) != 0;
-    const bool renderVideo = !pipelineReady || newVideoFrame || m_videoTextureDirty;
+    if (newVideoFrame) {
+        m_videoRenderPending = true;   // OR-in: 让行顺延, 帧不丢
+    }
+    bool renderVideo = !pipelineReady || m_videoTextureDirty;
+    if (!renderVideo && m_videoRenderPending) {
+        // 帧预算门控: 预测渲染成本 ≤ 单 vsync 周期才立即渲染; 超预算先让行
+        // (本 tick 复用缓存纹理), UI/弹幕节拍不被视频渲染成本拖慢。
+        // 防饿: 连续让行 2 tick 后强制渲染, 保证延迟不丢帧。
+        const qreal budgetMs = uiRefreshIntervalMs();
+        const bool affordable = m_videoRenderCostEwmaMs <= budgetMs;
+        const bool starved = m_videoRenderDeferTicks >= 2;
+        if (affordable || starved) {
+            renderVideo = true;
+            m_videoRenderDeferTicks = 0;
+        } else {
+            ++m_videoRenderDeferTicks;
+            ++m_perfDeferTicks;
+        }
+    }
 
     // 呈现记账 (与 GL 路径的 paintGL 一致)。
     mpv_render_frame_info info{};
@@ -934,6 +957,12 @@ void MpvWidget::render(QRhiCommandBuffer *cb) {
         const qint64 mpvNs = perfMpv.nsecsElapsed();
         m_perfMpvNs += mpvNs;
         m_perfMpvMaxNs = std::max(m_perfMpvMaxNs, mpvNs);
+        const qreal costMs = mpvNs / 1e6;
+        m_videoRenderCostEwmaMs = m_videoRenderCostEwmaMs <= 0.0
+            ? costMs : 0.5 * m_videoRenderCostEwmaMs + 0.5 * costMs;
+        m_videoRenderPending = false;      // 无论成败: 下一帧由 UPDATE_FRAME 重新置位
+        m_videoRenderDeferTicks = 0;
+        ++m_perfVideoRenders;
         // 有限诊断: 首几帧打印渲染结果与帧信息标志, 便于定位呈现链路断点。
         static int diagnosticFrames = 0;
         static int diagnosticFailures = 0;
@@ -983,7 +1012,9 @@ void MpvWidget::render(QRhiCommandBuffer *cb) {
                 << "| frameMaxMs:" << m_perfFrameMaxNs / 1e6
                 << "| uiTimerActive:" << m_uiRefreshTimer.isActive()
                 << "| paceVsync:" << m_perfPaceVsync
-                << "| paceFallback:" << m_perfPaceFallback;
+                << "| paceFallback:" << m_perfPaceFallback
+                << "| videoRenders:" << m_perfVideoRenders
+                << "| deferTicks:" << m_perfDeferTicks;
         m_perfClock.restart();
         m_perfPaints = 0;
         m_perfTicks = 0;
@@ -991,6 +1022,7 @@ void MpvWidget::render(QRhiCommandBuffer *cb) {
         m_perfRasterNs = m_perfRasterMaxNs = 0;
         m_perfMpvNs = m_perfMpvMaxNs = 0;
         m_perfFrameMaxNs = 0;
+        m_perfVideoRenders = m_perfDeferTicks = 0;
     }
 }
 

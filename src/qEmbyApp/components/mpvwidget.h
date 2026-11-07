@@ -200,6 +200,11 @@ private:
     qint64 m_perfMpvNs = 0;
     qint64 m_perfMpvMaxNs = 0;
     qint64 m_perfFrameMaxNs = 0;
+    bool m_videoRenderPending = false;                 // 有待渲视频帧 (让行顺延不丢帧)
+    int m_videoRenderDeferTicks = 0;                   // 连续让行计数 (防饿)
+    qreal m_videoRenderCostEwmaMs = 0.0;               // mpv 渲染成本 EWMA (预算门控)
+    qint64 m_perfVideoRenders = 0;                     // 窗口内 mpv 渲染次数
+    qint64 m_perfDeferTicks = 0;                       // 窗口内预算让行次数
     ID3D11Texture2D *m_d3dColorTex = nullptr;          // AddRef
     ID3D11RenderTargetView *m_d3dColorRtv = nullptr;   // owned
     ID3D11Texture2D *m_danmakuTex = nullptr;           // owned
