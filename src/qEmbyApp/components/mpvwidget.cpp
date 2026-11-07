@@ -150,8 +150,14 @@ MpvWidget::MpvWidget(QWidget *parent)
         if (m_uiRefreshTimer.interval() != interval) {
             m_uiRefreshTimer.setInterval(interval);
         }
-        ++m_perfTicks;
-        update();
+        // 兜底节拍: 仅当 vsync 呈现反馈陈旧 (无 frameSubmitted 驱动) 时才
+        // 以定时器驱动重绘; vsync 自持链活跃时定时器空转不派发重绘。
+        const qint64 staleMs = std::max<qint64>(50, 4LL * uiRefreshIntervalMs());
+        if (!m_paceVsyncClock.isValid() || m_paceVsyncClock.elapsed() > staleMs) {
+            ++m_perfTicks;
+            ++m_perfPaceFallback;
+            update();
+        }
     });
 #else
     : QOpenGLWidget(parent), m_mpv_gl(nullptr) {
@@ -183,6 +189,13 @@ MpvWidget::MpvWidget(QWidget *parent)
     connect(this, &QRhiWidget::frameSubmitted, this, [this]() {
         handleSurfacePresented();
         Q_EMIT surfaceFrameSwapped();
+        // vsync 呈现反馈自持节拍: 呈现完成后立即调度下一拍, 重绘率锁定屏幕刷新率。
+        m_paceVsyncClock.start();
+        if (uiPacingNeeded()) {
+            ++m_perfTicks;
+            ++m_perfPaceVsync;
+            update();
+        }
     }, Qt::DirectConnection);
 #else
     connect(this, &QOpenGLWidget::aboutToCompose, this, [this]() {
@@ -818,11 +831,16 @@ int MpvWidget::uiRefreshIntervalMs() const {
     return std::max(4, qRound(1000.0 / refreshHz));
 }
 
+bool MpvWidget::uiPacingNeeded() const {
+    const bool danmakuActive = m_nativeDanmakuOverlay && m_nativeDanmakuOverlay->isActive();
+    return m_mediaLoaded && (danmakuActive || !m_playbackPaused);
+}
+
 void MpvWidget::updateUiRefreshTimer() {
     const bool danmakuActive = m_nativeDanmakuOverlay && m_nativeDanmakuOverlay->isActive();
     // UI 节拍与视频帧率解耦: 有媒体在播 (或弹幕活动) 时按屏幕刷新率驱动重绘,
     // 弹幕位移由引擎按物理时钟外推, 保证满刷新率平滑度。
-    const bool needed = m_mediaLoaded && (danmakuActive || !m_playbackPaused);
+    const bool needed = uiPacingNeeded();
     if (needed != m_uiRefreshTimer.isActive()) {
         qInfo() << "[MpvWidget] UI refresh timer | active:" << needed
                 << "| mediaLoaded:" << m_mediaLoaded
@@ -963,10 +981,13 @@ void MpvWidget::render(QRhiCommandBuffer *cb) {
                 << "| mpvAvgMs:" << m_perfMpvNs / 1e6 / paints
                 << "| mpvMaxMs:" << m_perfMpvMaxNs / 1e6
                 << "| frameMaxMs:" << m_perfFrameMaxNs / 1e6
-                << "| uiTimerActive:" << m_uiRefreshTimer.isActive();
+                << "| uiTimerActive:" << m_uiRefreshTimer.isActive()
+                << "| paceVsync:" << m_perfPaceVsync
+                << "| paceFallback:" << m_perfPaceFallback;
         m_perfClock.restart();
         m_perfPaints = 0;
         m_perfTicks = 0;
+        m_perfPaceVsync = m_perfPaceFallback = 0;
         m_perfRasterNs = m_perfRasterMaxNs = 0;
         m_perfMpvNs = m_perfMpvMaxNs = 0;
         m_perfFrameMaxNs = 0;

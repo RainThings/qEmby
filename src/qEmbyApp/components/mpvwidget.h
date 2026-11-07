@@ -129,6 +129,8 @@ private:
                          const QSize &targetSize);
     void updateUiRefreshTimer();
     int uiRefreshIntervalMs() const;
+    // UI 节拍条件 (媒体在播或弹幕活动), 定时器兜底与 vsync 自持链共用。
+    bool uiPacingNeeded() const;
     ID3D11Device *d3dDevice() const;
     ID3D11DeviceContext *d3dContext() const;
 #else
@@ -183,6 +185,7 @@ private:
     QSize m_videoTexSize;
     bool m_videoTextureDirty = true;                   // 纹理新建/换尺寸后需强制重渲染
     QTimer m_uiRefreshTimer;                           // 独立 UI 节拍 (屏幕刷新率)
+    QElapsedTimer m_paceVsyncClock;                    // 上次 vsync 驱动重拍的时刻 (陈旧判定)
     bool m_playbackPaused = true;
     qreal m_lastDanmakuRasterPos = -1.0;               // 上次弹幕光栅的时钟位置
     QSize m_lastDanmakuRasterSize;                     // 上次弹幕光栅的表面尺寸
@@ -190,6 +193,8 @@ private:
     QElapsedTimer m_perfClock;
     qint64 m_perfPaints = 0;
     qint64 m_perfTicks = 0;
+    int m_perfPaceVsync = 0;
+    int m_perfPaceFallback = 0;
     qint64 m_perfRasterNs = 0;
     qint64 m_perfRasterMaxNs = 0;
     qint64 m_perfMpvNs = 0;
