@@ -136,7 +136,7 @@
     "src/qEmbyApp/components/mpvhttpstreamrelay.h": "49e4be0f8bb98daffafc8513b63ebf6e05ae6bddc587a0d11d4e8f50bdf9b232",
     "src/qEmbyApp/components/mpvinfodialog.cpp": "1d4d81b9590f9240ce9d29cd22cc3711a82f8ba59cc0b424f7fe3260c6565304",
     "src/qEmbyApp/components/mpvinfodialog.h": "fa6a6c21a6793614b2e60e2c2967f758fbff366be79e34d46366c4631bc8c2d1",
-    "src/qEmbyApp/components/mpvwidget.cpp": "29cb75db628c6556b122217285c116aa328f658b7538a82c2b33e079d6b4cc20",
+    "src/qEmbyApp/components/mpvwidget.cpp": "b38bf76e53ab14a7786b64cfa748f580001d203788181c5d095832a2d6a9f60d",
     "src/qEmbyApp/components/mpvwidget.h": "0ef4357af69bceaaec5c686a1235842b03744cd6a14b27d356a9e9b425876fc0",
     "src/qEmbyApp/components/musictracklistwidget.cpp": "83983a359b26563dd62aa0579b582a9eb1f9488a426719ec00b563f35b090f31",
     "src/qEmbyApp/components/musictracklistwidget.h": "31173d9389db0bbf3f59c2930ebe10c0d023a7498e23b3c2780fa4e180da53ec",
